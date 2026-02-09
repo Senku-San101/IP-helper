@@ -36,41 +36,177 @@ load_persistent_configs() {
     fi
 }
 
+detect_os_network_config() {
+    if [[ -d /etc/sysconfig/network-scripts ]]; then
+        echo "redhat"
+    elif [[ -f /etc/debian_version ]] && [[ -d /etc/network ]]; then
+        echo "debian"
+    else
+        echo "unknown"
+    fi
+}
+
+cidr_to_netmask() {
+    local cidr="$1"
+    local mask=""
+    for i in {1..4}; do
+        if [ $cidr -ge 8 ]; then
+            mask+=255
+            cidr=$((cidr-8))
+        elif [ $cidr -gt 0 ]; then
+            mask+=$((256 - 2**(8-cidr)))
+            cidr=0
+        else
+            mask+=0
+        fi
+        [ $i -lt 4 ] && mask+=.
+    done
+    echo "$mask"
+}
+
 save_to_persistent() {
     local interface="$1"
     local config_type="$2"
     local value="$3"
     
-    # Create backup
+    local os_type=$(detect_os_network_config)
+    
+    case $os_type in
+        "debian")
+            save_to_debian_config "$interface" "$config_type" "$value"
+            ;;
+        "redhat")
+            save_to_redhat_config "$interface" "$config_type" "$value"
+            ;;
+        *)
+            echo "✗ Unsupported OS for automatic persistence."
+            save_to_custom_config "$interface" "$config_type" "$value"
+            return 1
+            ;;
+    esac
+    
+    if [ $? -eq 0 ]; then
+        log_action "SAVED_PERSISTENT: $config_type for $interface: $value"
+        echo "✓ Configuration saved persistently for $os_type"
+    fi
+}
+
+save_to_debian_config() {
+    local interface="$1"
+    local config_type="$2"
+    local value="$3"
+    local config_file="/etc/network/interfaces"
+    
+    [ ! -f "$config_file" ] && echo "# Network interfaces" | sudo tee "$config_file" > /dev/null
+    
+    local backup_file="${config_file}.backup.$(date +%s)"
+    sudo cp "$config_file" "$backup_file" 2>/dev/null
+    
+    case $config_type in
+        "IP")
+            local ip_addr=$(echo "$value" | cut -d'/' -f1)
+            local prefix=$(echo "$value" | cut -d'/' -f2)
+            local netmask=$(cidr_to_netmask "$prefix")
+            
+            if ! grep -q "^iface $interface inet" "$config_file"; then
+                echo -e "\n# Added by ip-helper script $(date)\nauto $interface\niface $interface inet static\n    address $ip_addr\n    netmask $netmask" | sudo tee -a "$config_file" > /dev/null
+            else
+                sudo sed -i "/^iface $interface inet static/,/^iface\|^auto\|^$/ { /^[[:space:]]*address/d; /^[[:space:]]*netmask/d; }" "$config_file"
+                sudo sed -i "/^iface $interface inet static/ a\    address $ip_addr\n    netmask $netmask" "$config_file"
+            fi
+            ;;
+        "VLAN")
+            local vlan_name="$value"
+            local parent_iface="${vlan_name%.*}"
+            
+            if ! grep -q "^iface $vlan_name inet" "$config_file"; then
+                echo -e "\n# VLAN added by ip-helper script $(date)\nauto $vlan_name\niface $vlan_name inet manual\n    vlan-raw-device $parent_iface" | sudo tee -a "$config_file" > /dev/null
+            fi
+            ;;
+        "MTU")
+            local mtu_value="$value"
+            if grep -q "^iface $interface inet" "$config_file"; then
+                sudo sed -i "/^iface $interface inet/,/^iface\|^auto\|^$/ { /^[[:space:]]*mtu/d; }" "$config_file"
+                sudo sed -i "/^iface $interface inet/ a\    mtu $mtu_value" "$config_file"
+            fi
+            ;;
+    esac
+}
+
+save_to_redhat_config() {
+    local interface="$1"
+    local config_type="$2"
+    local value="$3"
+    local config_dir="/etc/sysconfig/network-scripts"
+    local config_file="${config_dir}/ifcfg-${interface}"
+    
+    sudo mkdir -p "$config_dir"
+    
+    if [ ! -f "$config_file" ]; then
+        echo -e "# Created by ip-helper script\nDEVICE=$interface\nBOOTPROTO=none\nONBOOT=yes\nTYPE=Ethernet\nUSERCTL=no" | sudo tee "$config_file" > /dev/null
+    fi
+    
+    case $config_type in
+        "IP")
+            local ip_addr=$(echo "$value" | cut -d'/' -f1)
+            local prefix=$(echo "$value" | cut -d'/' -f2)
+            
+            sudo grep -q "^IPADDR=" "$config_file" && \
+                sudo sed -i "s/^IPADDR=.*/IPADDR=$ip_addr/" "$config_file" || \
+                echo "IPADDR=$ip_addr" | sudo tee -a "$config_file" > /dev/null
+            
+            sudo grep -q "^PREFIX=" "$config_file" && \
+                sudo sed -i "s/^PREFIX=.*/PREFIX=$prefix/" "$config_file" || \
+                echo "PREFIX=$prefix" | sudo tee -a "$config_file" > /dev/null
+            
+            sudo sed -i 's/^BOOTPROTO=.*/BOOTPROTO=none/' "$config_file"
+            ;;
+        "VLAN")
+            local vlan_name="$value"
+            local vlan_id="${vlan_name#*.}"
+            
+            echo "VLAN=yes" | sudo tee -a "$config_file" > /dev/null
+            echo "VLAN_ID=$vlan_id" | sudo tee -a "$config_file" > /dev/null
+            ;;
+    esac
+}
+
+save_to_custom_config() {
+    local interface="$1"
+    local config_type="$2"
+    local value="$3"
+    
     local timestamp=$(date +%Y%m%d_%H%M%S)
     cp "$CONFIG_FILE" "${BACKUP_DIR}/interfaces_${timestamp}.bak" 2>/dev/null || true
     
-    # Save to config file
     {
         echo "# Auto-generated by ip-helper script"
         echo "# Last updated: $(date)"
         echo ""
-        for iface in "${!INTERFACE_CONFIGS[@]}"; do
-            echo "INTERFACE_CONFIGS[$iface]='${INTERFACE_CONFIGS[$iface]}'"
-        done
-    } > "$CONFIG_FILE"
+        echo "# $interface:$config_type:$value:$(date)"
+    } | sudo tee -a "$CONFIG_FILE" > /dev/null
     
-    log_action "SAVED: $config_type for $interface: $value"
-    echo "✓ Configuration saved persistently"
+    log_action "SAVED_CUSTOM: $config_type for $interface: $value"
+    echo "✓ Configuration saved to custom file"
 }
 
 apply_persistent_configs() {
-    if [ -f "$CONFIG_FILE" ]; then
-        echo "Applying persistent configurations..."
-        source "$CONFIG_FILE" 2>/dev/null || true
-        
-        for iface in "${!INTERFACE_CONFIGS[@]}"; do
-            echo "  Applying config for $iface..."
-            # Here you would parse and apply the saved configurations
-            # This is a simplified version
-        done
-        echo "✓ Persistent configurations applied"
-    fi
+    local os_type=$(detect_os_network_config)
+    echo "Applying persistent configurations for $os_type..."
+    
+    case $os_type in
+        "debian")
+            sudo systemctl restart networking 2>/dev/null || sudo /etc/init.d/networking restart
+            echo "✓ Restarted Debian networking service"
+            ;;
+        "redhat")
+            sudo systemctl restart network 2>/dev/null || sudo service network restart
+            echo "✓ Restarted Red Hat network service"
+            ;;
+        *)
+            echo "! Could not apply configs: Unknown OS"
+            ;;
+    esac
 }
 
 # ==================== UTILITY FUNCTIONS ====================
@@ -79,11 +215,10 @@ log_action() {
 }
 
 validate_interface() {
-    # Extract just the child interface name (before the @)
     local interface_name="${1%%@*}"
     
-    if ! ip link show "$1" &>/dev/null; then
-        echo "ERROR: Interface '$1' does not exist."
+    if ! ip link show "$interface_name" &>/dev/null; then
+        echo "ERROR: Interface '$interface_name' does not exist."
         return 1
     fi
     return 0
@@ -94,10 +229,10 @@ show_current_state() {
     
     echo ""
     echo "========================================="
-    echo "CURRENT STATE for $SELECTED_INTERFACE"
+    echo "CURRENT STATE for $interface_name"
     echo "========================================="
-    ip -brief addr show dev "$SELECTED_INTERFACE" 2>/dev/null || echo "Interface not found"
-    ip -brief link show dev "$SELECTED_INTERFACE" 2>/dev/null || echo "Interface not found"
+    ip -brief addr show dev "$interface_name" 2>/dev/null || echo "Interface not found"
+    ip -brief link show dev "$interface_name" 2>/dev/null || echo "Interface not found"
     echo "========================================="
     echo ""
 }
@@ -117,22 +252,20 @@ execute_with_preview() {
                 echo "✓ Command executed successfully."
                 log_action "EXECUTED: $COMMAND_PREVIEW"
                 
-                # Ask about persistence
                 read -p "Save this change persistently? (y/N): " save_confirm
                 if [[ "$save_confirm" =~ ^[Yy]$ ]]; then
-                    # Extract configuration type and value from command
                     local config_type=""
                     local config_value=""
                     
                     if [[ "$COMMAND_PREVIEW" == *"addr add"* ]]; then
                         config_type="IP"
-                        config_value=$(echo "$COMMAND_PREVIEW" | grep -oP 'addr add \K[^ ]+')
+                        config_value=$(echo "$COMMAND_PREVIEW" | grep -o 'addr add [^ ]*' | cut -d' ' -f3)
                     elif [[ "$COMMAND_PREVIEW" == *"link add"* && "$COMMAND_PREVIEW" == *"vlan"* ]]; then
                         config_type="VLAN"
-                        config_value=$(echo "$COMMAND_PREVIEW" | grep -oP 'name \K[^ ]+')
+                        config_value=$(echo "$COMMAND_PREVIEW" | grep -o 'name [^ ]*' | cut -d' ' -f2)
                     elif [[ "$COMMAND_PREVIEW" == *"link set"* && "$COMMAND_PREVIEW" == *"mtu"* ]]; then
                         config_type="MTU"
-                        config_value=$(echo "$COMMAND_PREVIEW" | grep -oP 'mtu \K[^ ]+')
+                        config_value=$(echo "$COMMAND_PREVIEW" | grep -o 'mtu [^ ]*' | cut -d' ' -f2)
                     fi
                     
                     if [ -n "$config_type" ] && [ -n "$config_value" ]; then
@@ -158,21 +291,16 @@ select_interface() {
     echo "========================================"
     echo ""
     
-    # Get list of interfaces
-    declare -a interfaces_display  # For display (e.g., virbr1.1@virbr1)
-    declare -a interfaces_clean    # For commands (e.g., virbr1.1)
+    declare -a interfaces_display
+    declare -a interfaces_clean
     local count=1
     
     echo "Available network interfaces:"
     while read -r line; do
-        # Get the full interface name from ip command
         full_iface=$(echo "$line" | awk '{print $1}')
         state=$(echo "$line" | awk '{print $3}')
         
-        # Store both display and clean names
         interfaces_display[$count]="$full_iface"
-        
-        # Extract clean name (remove @parent part)
         clean_iface="${full_iface%%@*}"
         interfaces_clean[$count]="$clean_iface"
         
@@ -196,7 +324,6 @@ select_interface() {
         echo "Exiting. Goodbye!"
         exit 0
     elif [ "$choice" -ge 1 ] && [ "$choice" -lt "$count" ]; then
-        # Store the CLEAN interface name for commands
         SELECTED_INTERFACE="${interfaces_clean[$choice]}"
         echo "Selected interface: ${interfaces_display[$choice]}"
         return 0
@@ -225,6 +352,7 @@ module_link() {
         echo "8. Add interface to bridge"
         echo "9. Create bond interface"
         echo "10. Show detailed link info"
+        echo "11. Delete virtual interface"
         echo "0. Back to interface selection"
         echo ""
         
@@ -278,7 +406,6 @@ module_link() {
                     COMMAND_PREVIEW="ip link add link $SELECTED_INTERFACE name $vlan_name type vlan id $vlan_id"
                     execute_with_preview
                     
-                    # Ask to bring it up and add IP
                     if [ $? -eq 0 ]; then
                         read -p "Bring up the VLAN interface and add IP? (y/N): " vlan_setup
                         if [[ "$vlan_setup" =~ ^[Yy]$ ]]; then
@@ -323,6 +450,30 @@ module_link() {
                 echo ""
                 ip -details link show dev "$SELECTED_INTERFACE"
                 read -p "Press Enter to continue..."
+                ;;
+            11)
+                echo "Virtual interfaces detected:"
+                ip -brief link show | grep -E "\.|@" | awk '{print $1}' | while read iface; do
+                    clean_iface="${iface%%@*}"
+                    state=$(ip -brief link show dev "$clean_iface" 2>/dev/null | awk '{print $3}')
+                    echo "  $clean_iface ($state)"
+                done
+                read -p "Enter the exact name of the interface to DELETE: " iface_to_delete
+                if [[ -n "$iface_to_delete" ]]; then
+                    read -p "ARE YOU SURE? (type 'DELETE' to confirm): " confirm
+                    if [[ "$confirm" == "DELETE" ]]; then
+                        $SUDO_CMD ip link set dev "$iface_to_delete" down 2>/dev/null
+                        COMMAND_PREVIEW="ip link delete dev $iface_to_delete"
+                        execute_with_preview
+                        local os_type=$(detect_os_network_config)
+                        if [[ "$os_type" == "redhat" ]]; then
+                            sudo rm -f "/etc/sysconfig/network-scripts/ifcfg-${iface_to_delete}" 2>/dev/null
+                            echo "Removed Red Hat config file."
+                        fi
+                    else
+                        echo "Deletion cancelled."
+                    fi
+                fi
                 ;;
             0)
                 return
@@ -453,17 +604,15 @@ main() {
     initialize
     
     while true; do
-        # Step 1: Select interface
         select_interface
         select_result=$?
         
         if [ $select_result -eq 2 ]; then
-            continue  # Applied persistent configs, go back to interface selection
+            continue
         elif [ $select_result -ne 0 ]; then
-            continue  # Invalid selection, try again
+            continue
         fi
         
-        # Step 2: Select module for the chosen interface
         while true; do
             clear
             echo "========================================"
@@ -494,7 +643,7 @@ main() {
                     read -p "Press Enter to continue..."
                     ;;
                 0)
-                    break  # Go back to interface selection
+                    break
                     ;;
                 *)
                     echo "Invalid option."
@@ -506,8 +655,6 @@ main() {
 }
 
 # ==================== SCRIPT START ====================
-# Trap for safe exit
 trap 'echo -e "\nSaving configurations before exit..."; save_to_persistent "SYSTEM" "EXIT" "User interrupted"; exit 0' INT TERM
 
-# Start the main program
 main
