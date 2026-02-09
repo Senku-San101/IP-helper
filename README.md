@@ -110,7 +110,7 @@ Example: Adding a VLAN
 
 📂 Configuration Persistence
 
-The script stores your configurations in /etc/network/interfaces.d/ip-helper-persistent and creates automatic backups in /etc/network/interfaces.d/backups/. You can apply all saved configurations at once from the main menu.
+The script stores your configurations in /etc/network/interfaces.d/ip-helper-persistent. You can apply all saved configurations at once from the main menu.
 
 🔄 Interface Selection
 
